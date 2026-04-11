@@ -114,7 +114,8 @@ class AVCILNet(nn.Module):
         self.heads = nn.ModuleList()     # 始终只放一个 head（单头设计）
         self.task_cls = torch.tensor([], dtype=torch.long)
         self.task_offset = torch.tensor([], dtype=torch.long)
-        self.schedule_step = [80, 120]
+        self.schedule_step = []
+        # self.schedule_step = [80, 120]
 
     def _build_classifier(self, num_classes):
         if self.use_lsc:
@@ -250,47 +251,56 @@ class AVCILNet(nn.Module):
                 m.eval()
 
 
-class AVCILNetWrapper(nn.Module):
+class LLL_Net(nn.Module):
     """
-    将单头 logits 转成 FACIL 常见的 list[Tensor] 形式，减少 approach 改动。
+    AVCIL-specialized LLL_Net adapter for main_incremental compatibility.
+    Signature aligned with other LLL_Net: __init__(model, remove_existing_head=False)
     """
-    def __init__(self, avnet):
+    def __init__(self, model, remove_existing_head=False):
         super().__init__()
-        self.avnet = avnet
-        self.heads = nn.ModuleList([])
-        self.task_cls = []
-        self.task_offset = []
+        # For avcil, model is expected to be an AVCILNet-like object (single-head incremental classifier inside)
+        # remove_existing_head is intentionally ignored for compatibility with main_incremental.
+        self.model = model
+        self.schedule_step = []
+        # self.schedule_step = [80, 120]
+
+        # expose fields expected by approaches / logger / framework
+        self.heads = self.model.heads
+        self.task_cls = self.model.task_cls
+        self.task_offset = self.model.task_offset
 
     def add_head(self, num_outputs):
-        self.avnet.add_head(num_outputs)
-        self.update_meta()
+        self.model.add_head(num_outputs)
+        self._sync_meta()
 
-    def update_meta(self):
-        self.heads = self.avnet.heads
-        self.task_cls = self.avnet.task_cls.tolist() if torch.is_tensor(self.avnet.task_cls) else self.avnet.task_cls
-        self.task_offset = self.avnet.task_offset.tolist() if torch.is_tensor(self.avnet.task_offset) else self.avnet.task_offset
+    def _sync_meta(self):
+        self.heads = self.model.heads
+        self.task_cls = self.model.task_cls
+        self.task_offset = self.model.task_offset
 
     def forward(self, x, return_features=False):
+        # keep same style as network.py: return list[logits]
         if return_features:
-            logits, features = self.avnet.forward(x, return_features=True)
-            return [logits], features
-        logits = self.avnet.forward(x, return_features=False)
+            logits, feats = self.model(x, return_features=True)
+            return [logits], feats
+        logits = self.model(x, return_features=False)
         return [logits]
 
     def freeze_backbone(self):
-        self.avnet.freeze_backbone()
+        self.model.freeze_backbone()
 
     def freeze_all(self):
-        self.avnet.freeze_all()
+        self.model.freeze_all()
 
     def freeze_bn(self):
-        self.avnet.freeze_bn()
+        self.model.freeze_bn()
 
     def get_copy(self):
-        return self.avnet.get_copy()
+        return self.model.get_copy()
 
     def set_state_dict(self, state_dict):
-        self.avnet.set_state_dict(state_dict)
+        self.model.set_state_dict(state_dict)
+        self._sync_meta()
 
 
 # ---- factory functions required by main_incremental.py ----
@@ -308,15 +318,3 @@ def avcil_net(pretrained=False, **kwargs):
         backbone = AVAudioVisualBackbone()
     use_lsc = kwargs.pop('use_lsc', False)
     return AVCILNet(backbone=backbone, use_lsc=use_lsc)
-
-
-def avcil_wrapper(pretrained=False, **kwargs):
-    # optional wrapper version
-    avnet = kwargs.pop('avnet', None)
-    if avnet is None:
-        backbone = kwargs.pop('backbone', None)
-        if backbone is None:
-            backbone = AVAudioVisualBackbone()
-        use_lsc = kwargs.pop('use_lsc', False)
-        avnet = AVCILNet(backbone=backbone, use_lsc=use_lsc)
-    return AVCILNetWrapper(avnet)

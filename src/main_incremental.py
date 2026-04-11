@@ -27,7 +27,7 @@ def main(argv=None):
                         help='Results path (default=%(default)s)')
     parser.add_argument('--exp-name', default=None, type=str,
                         help='Experiment name (default=%(default)s)')
-    parser.add_argument('--seed', type=int, default=0,
+    parser.add_argument('--seed', type=int, default=42,
                         help='Random seed (default=%(default)s)')
     parser.add_argument('--log', default=['disk'], type=str, choices=['disk', 'tensorboard'],
                         help='Loggers used (disk, tensorboard) (default=%(default)s)', nargs='*', metavar="LOGGER")
@@ -99,6 +99,7 @@ def main(argv=None):
     # Args -- Incremental Learning Framework
     args, extra_args = parser.parse_known_args(argv)
     args.results_path = os.path.expanduser(args.results_path)
+    # extract base approach kwargs to pass to approach and gridsearch (if enabled)
     base_kwargs = dict(nepochs=args.nepochs, lr=args.lr, lr_min=args.lr_min, lr_factor=args.lr_factor,
                        lr_patience=args.lr_patience, clipgrad=args.clipping, momentum=args.momentum,
                        wd=args.weight_decay, multi_softmax=args.multi_softmax, wu_nepochs=args.warmup_nepochs,
@@ -108,6 +109,17 @@ def main(argv=None):
         print('WARNING: CUDNN Deterministic will be disabled.')
         utils.cudnn_deterministic = False
 
+    '''
+    def seed_everything(seed=0):
+        """Fix all random seeds"""
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        os.environ['PYTHONHASHSEED'] = str(seed)
+        torch.backends.cudnn.deterministic = cudnn_deterministic
+    '''
+    # I believe the seed_everything function will not influence the rng objects related to dataset and dataloader. I can confirm this by tests/test_dataloader.py.
     utils.seed_everything(seed=args.seed)
     print('=' * 108)
     print('Arguments =')
@@ -129,10 +141,20 @@ def main(argv=None):
     ####################################################################################################################
 
     # Args -- Network
+    '''
+    we have captioned in the src/networks/avcil_network.py that there are 2 ways to use the networks: 1) using the factory functions, which is more consistent with other networks (resnet series), and 2) using the classes directly, like LeNet or VggNet.
+    # ---- factory functions required by main_incremental.py ----
+    # We provide factory functions to create the backbone, main net, and optional wrapper, just like other networks (resnet series).
+    # We also have choice to use the classes directly, like LeNet or VggNet. (VggNet also has a factory function, but not using it. LeNet doesn't have a factory function.) 
+    # In conclusion, using factory functions is a more consistent design.
+    '''
     pod_flag = False
     if 'podnet' in args.approach:
         pod_flag = True
         from networks.network_podnet import LLL_Net
+    elif 'avcil' in args.approach:
+        avcil_flag = False
+        from networks.avcil_network import LLL_Net
     else:
         from networks.network import LLL_Net
     if 'podnet' in args.approach:
@@ -145,6 +167,11 @@ def main(argv=None):
             init_model = tvnet(pretrained=args.pretrained)
         set_tvmodel_head_var(init_model)
     else:  # other models declared in networks package's init
+        '''
+        equal to:
+        import networks
+        net = networks.<args.network>
+        '''
         net = getattr(importlib.import_module(name='networks'), args.network)
         # WARNING: fixed to pretrained False for other model (non-torchvision)
         init_model = net(pretrained=False)
@@ -203,11 +230,13 @@ def main(argv=None):
     # Apply arguments for loaders
     if args.use_valid_only:
         tst_loader = val_loader
+    # example of taskcla: [(0, 10), (1, 10), (2, 10), (3, 10)]
     max_task = len(taskcla) if args.stop_at_task == 0 else args.stop_at_task
 
     # Network and Approach instances
     utils.seed_everything(seed=args.seed)
     net = LLL_Net(init_model, remove_existing_head=not args.keep_existing_head)
+    # with approaches without scheduler, we can set schedule_step to like [10000, 20000] to avoid decreasing lr during training, since nepochs is set to 200 by default.
     net.schedule_step = args.schedule_step
     utils.seed_everything(seed=args.seed)
     # taking transformations and class indices from first train dataset
@@ -217,6 +246,7 @@ def main(argv=None):
     if Appr_ExemplarsDataset:
         appr_kwargs['exemplars_dataset'] = Appr_ExemplarsDataset(transform, class_indices,
                                                                  **appr_exemplars_dataset_args.__dict__)
+    # use seed_everything for several times to make sure all the random seeds are fixed for all the components of the framework, including dataset splitting, data loading, model initialization, and training.                                                             
     utils.seed_everything(seed=args.seed)
     appr = Appr(net, device, **appr_kwargs)
 
@@ -244,12 +274,17 @@ def main(argv=None):
         print('*' * 108)
 
         # Add head for current task
+        # if the taskcla is like [(0, 10), (1, 10), (2, 10), (3, 10)], 
+        # for podnet, net.add_head will be called with [10], [10, 10], [10, 10, 10], [10, 10, 10, 10] for the 4 tasks respectively
+        # for other approaches, net.add_head will be called with 10, 10, 10, 10
+        # the avcil newwork is aligned with other approaches in this aspect, so it's not any special in interface level.
         if pod_flag:
             net.add_head([elem[1] for elem in taskcla[:t+1][:]])
         else:
             net.add_head(taskcla[t][1])
         net.to(device)
 
+        # podnet needs to aware of the percentage of seen classes so far for the distillation loss. So we might can code this part more elegantly, but anyway need to make some change in the incremental loop.
         if 'podnet' in args.approach:
             n_classes = taskcla[t][1]
             appr._task_size = n_classes
@@ -257,6 +292,7 @@ def main(argv=None):
             appr.task_percent = (t+1) / len(taskcla)
         # print(net)
         # GridSearch
+        # if we don't want to apply gridsearch, just set args.gridsearch_tasks to 0 or -1
         if t < args.gridsearch_tasks:
 
             # Search for best finetuning learning rate -- Maximal Plasticity Search

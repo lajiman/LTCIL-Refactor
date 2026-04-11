@@ -8,6 +8,22 @@ import numpy as np
 from dataset_config import dataset_config
 from av_dataset import get_data, build_online_triplet
 
+# the output of get_data() should like this:
+# data = {
+#     0: {
+#         "name": "task-0",
+#         "trn": {"x": [...], "y": [...]},
+#         "val": {"x": [...], "y": [...]},
+#         "tst": {"x": [...], "y": [...]},
+#     },
+#     1: {
+#         "name": "task-1",
+#         "trn": {"x": [...], "y": [...]},
+#         "val": {"x": [...], "y": [...]},
+#         "tst": {"x": [...], "y": [...]},
+#     },
+#     ...
+# }
 
 def reconstruct_triplet_from_task_data(data, taskcla, class_order, category_encode_dict):
     """

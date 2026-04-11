@@ -8,7 +8,7 @@ from .resnet18_podnet import resnet18_podnet
 from .resnet_rebuffi import resnet_rebuffi
 
 # AVCIL
-from .avcil_network import avcil_backbone, avcil_net, avcil_wrapper
+from .avcil_network import avcil_backbone, avcil_net
 
 
 # available torchvision models
@@ -27,7 +27,7 @@ tvmodels = ['alexnet',
 # include avcil entries
 allmodels = tvmodels + [
     'resnet32', 'LeNet', 'VggNet', 'resnet_rebuffi', 'resnet32_podnet', 'resnet18_podnet',
-    'avcil_backbone', 'avcil_net', 'avcil_wrapper'
+    'avcil_backbone', 'avcil_net'
 ]
 
 

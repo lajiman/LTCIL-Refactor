@@ -1,5 +1,4 @@
 import os
-from pickle import NONE
 import numpy as np
 import random
 import torch
@@ -12,6 +11,7 @@ from torchvision.datasets import SVHN as TorchVisionSVHN
 
 from . import base_dataset as basedat
 from . import memory_dataset as memd
+from . import av_dataset as avdat
 from .dataset_config import dataset_config
 
 
@@ -93,6 +93,9 @@ def get_datasets(dataset, path, num_tasks, nc_first_task, validation, trn_transf
     """Extract datasets and create Dataset class"""
 
     trn_dset, val_dset, tst_dset = [], [], []
+    # I plan to add a data structure called av_extra at first, however, this sturcture can be used to store any extra information that is needed for the dataset.
+    # Therefore, I will use a more general name called extra_info to store any extra information that is needed for the dataset.
+    extra_info = {}
 
     if 'mnist' in dataset:
         # First load the data using Torchvision into memory, then get_data
@@ -203,6 +206,32 @@ def get_datasets(dataset, path, num_tasks, nc_first_task, validation, trn_transf
                                                                 class_order=class_order,lt = True)
             # set dataset type
         Dataset = basedat.BaseDataset
+    elif dataset.startswith('VGGSound') or dataset.startswith('AVE') or dataset.startswith('ksounds'):
+        dc = dataset_config[dataset]
+        specific = dc.get('specific', {})
+        feature_root = dc.get('feature_root', None)
+        
+        if feature_root is None:
+            raise ValueError(f"feature_root is required for AV dataset: {dataset}")
+
+        all_data, taskcla, class_indices = avdat.get_data(
+            csv_path=path,                   # path 在 dataset_config 里是 csv 路径
+            feature_root=feature_root,
+            num_tasks=num_tasks,
+            nc_first_task=nc_first_task,
+            validation=validation,
+            shuffle_classes=class_order is None,
+            class_order=class_order,
+            specific=specific,
+        )
+
+        Dataset = avdat.VGGDataset
+        extra_info = {
+            "feature_root": feature_root,
+            "modality": specific.get("modality", "audio-visual"),
+            "dataset_name": specific.get("dataset_name", "VGGSound"),
+            "specific": specific,
+        }
     else:
         # read data paths and compute splits -- path needs to have a train.txt and a test.txt with image-label pairs
         all_data, taskcla, class_indices = basedat.get_data(path, num_tasks=num_tasks, nc_first_task=nc_first_task,
@@ -212,15 +241,32 @@ def get_datasets(dataset, path, num_tasks, nc_first_task, validation, trn_transf
         Dataset = basedat.BaseDataset
 
     # get datasets, apply correct label offsets for each task
+    # offset = 0
+    # for task in range(num_tasks):
+    #     # example: task0 [0-9] -> [0-9], task1 [0-9] -> [10-19], task2 [0-9] -> [20-29]
+    #     all_data[task]['trn']['y'] = [label + offset for label in all_data[task]['trn']['y']]
+    #     all_data[task]['val']['y'] = [label + offset for label in all_data[task]['val']['y']]
+    #     all_data[task]['tst']['y'] = [label + offset for label in all_data[task]['tst']['y']]
+    #     trn_dset.append(Dataset(all_data[task]['trn'], trn_transform, class_indices))
+    #     val_dset.append(Dataset(all_data[task]['val'], tst_transform, class_indices))
+    #     tst_dset.append(Dataset(all_data[task]['tst'], tst_transform, class_indices))
+    #     offset += taskcla[task][1]
     offset = 0
     for task in range(num_tasks):
-        # example: task0 [0-9] -> [0-9], task1 [0-9] -> [10-19], task2 [0-9] -> [20-29]
         all_data[task]['trn']['y'] = [label + offset for label in all_data[task]['trn']['y']]
         all_data[task]['val']['y'] = [label + offset for label in all_data[task]['val']['y']]
         all_data[task]['tst']['y'] = [label + offset for label in all_data[task]['tst']['y']]
-        trn_dset.append(Dataset(all_data[task]['trn'], trn_transform, class_indices))
-        val_dset.append(Dataset(all_data[task]['val'], tst_transform, class_indices))
-        tst_dset.append(Dataset(all_data[task]['tst'], tst_transform, class_indices))
+
+        if Dataset is avdat.VGGDataset:
+            # actually trn_transform and tst_transform are redundant arguments for avdat.VGGDataset, so we don't need to set them to None, but I set them to None to make it clear that they are not used in this case.
+            trn_dset.append(Dataset(all_data[task]['trn'], None, class_indices, **extra_info))
+            val_dset.append(Dataset(all_data[task]['val'], None, class_indices, **extra_info))
+            tst_dset.append(Dataset(all_data[task]['tst'], None, class_indices, **extra_info))
+        else:
+            trn_dset.append(Dataset(all_data[task]['trn'], trn_transform, class_indices))
+            val_dset.append(Dataset(all_data[task]['val'], tst_transform, class_indices))
+            tst_dset.append(Dataset(all_data[task]['tst'], tst_transform, class_indices))
+
         offset += taskcla[task][1]
     print(len(trn_dset))
     print(len(val_dset))
