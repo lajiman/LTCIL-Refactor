@@ -248,9 +248,8 @@ class Appr(Inc_Learning_Appr):
                 audio = data[1].to(self.device)
                 targets = targets.to(self.device)
 
-                outputs = self.model((visual, audio))   # single head logits tensor [B, C]
-                # 为兼容基类metrics，包装成list
-                outputs_list = [outputs]
+                # now the LLLNet in avcil_network.py has already wrap the logit as a list for criterion style, so we can directly use that without modification. If your model returns a single tensor, you can wrap it in a list like outputs = [self.model((visual, audio))] to keep the criterion style consistent.
+                outputs_list = self.model((visual, audio))   # single head logits tensor [B, C]
 
                 loss = self.criterion(t, outputs_list, targets)
                 hits_taw, hits_tag = self.calculate_metrics(outputs_list, targets)

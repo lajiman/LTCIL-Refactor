@@ -161,8 +161,9 @@ class AVCILNet(nn.Module):
         self.heads = nn.ModuleList([self.classifier])
 
         # in multi-head design, task_cls is like [10,10,10], while in single-head design, we can just maintain the total class number in task_cls[0], for example [30], and keep task_offset[0] as 0.
-        self.task_cls = torch.tensor([self.num_classes], dtype=torch.long)
-        self.task_offset = torch.tensor([0], dtype=torch.long)
+        dev = self.classifier.weight.device
+        self.task_cls = torch.tensor([self.num_classes], dtype=torch.long, device=dev)
+        self.task_offset = torch.tensor([0], dtype=torch.long, device=dev)
 
     def forward(
         self,
@@ -258,33 +259,37 @@ class LLL_Net(nn.Module):
     """
     def __init__(self, model, remove_existing_head=False):
         super().__init__()
-        # For avcil, model is expected to be an AVCILNet-like object (single-head incremental classifier inside)
-        # remove_existing_head is intentionally ignored for compatibility with main_incremental.
         self.model = model
         self.schedule_step = []
-        # self.schedule_step = [80, 120]
 
-        # expose fields expected by approaches / logger / framework
-        self.heads = self.model.heads
-        self.task_cls = self.model.task_cls
-        self.task_offset = self.model.task_offset
+    @property
+    def heads(self):
+        return self.model.heads
+
+    @property
+    def task_cls(self):
+        dev = next(self.model.parameters()).device
+        return self.model.task_cls.to(dev)
+
+    @property
+    def task_offset(self):
+        dev = next(self.model.parameters()).device
+        return self.model.task_offset.to(dev)
 
     def add_head(self, num_outputs):
         self.model.add_head(num_outputs)
-        self._sync_meta()
 
-    def _sync_meta(self):
-        self.heads = self.model.heads
-        self.task_cls = self.model.task_cls
-        self.task_offset = self.model.task_offset
-
-    def forward(self, x, return_features=False):
-        # keep same style as network.py: return list[logits]
-        if return_features:
+    def forward(self, x, return_features=False, **kwargs):
+        # FACIL compatible path
+        if return_features and not kwargs:
             logits, feats = self.model(x, return_features=True)
             return [logits], feats
-        logits = self.model(x, return_features=False)
-        return [logits]
+        if not return_features and not kwargs:
+            logits = self.model(x, return_features=False)
+            return [logits]
+
+        # AVCIL extended path
+        return self.model(x, return_features=return_features, **kwargs)
 
     def freeze_backbone(self):
         self.model.freeze_backbone()
@@ -300,7 +305,6 @@ class LLL_Net(nn.Module):
 
     def set_state_dict(self, state_dict):
         self.model.set_state_dict(state_dict)
-        self._sync_meta()
 
 
 # ---- factory functions required by main_incremental.py ----

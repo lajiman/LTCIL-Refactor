@@ -22,11 +22,23 @@ class MemoryDataset(Dataset):
 
     def __getitem__(self, index):
         """Generates one sample of data"""
-        x = Image.fromarray(self.images[index])
-        x = self.transform(x)
+        # x = Image.fromarray(self.images[index])
+        # x = self.transform(x)
+        # y = self.labels[index]
+        # return x, y
+        x = self.images[index]
         y = self.labels[index]
-        return x, y
 
+        # Case 1: AV exemplar, e.g. x = (visual_feat, audio_feat)
+        if isinstance(x, tuple):
+            # keep feature tensors/arrays as-is; transform usually image-only, so skip it
+            return x, y
+
+        # Case 2: image exemplar (original behavior)
+        x = Image.fromarray(x)
+        x = self.transform(x)
+        return x, y
+        
 
 def get_data(trn_data, tst_data, num_tasks, nc_first_task, validation, shuffle_classes, class_order=None):
     """Prepare data: dataset splits, task partition, class order"""
