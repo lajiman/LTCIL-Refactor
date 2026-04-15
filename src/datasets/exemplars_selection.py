@@ -34,8 +34,13 @@ class ExemplarsSelector:
                                     num_workers=trn_loader.num_workers, pin_memory=trn_loader.pin_memory)
             selected_indices = self._select_indices(model, sel_loader, exemplars_per_class, transform)
         # fourth step: get the samples corresponding to the selected indices, using the original transform (not the selection transform). This is done by creating a new loader with the same dataset but with the original transform, and then getting the samples corresponding to the selected indices from this new loader. The order of the samples in this new loader should be the same as the original loader, otherwise the selected indices will not correspond to the correct samples in the original dataset.
-        with override_dataset_transform(trn_loader.dataset, Lambda(lambda x: np.array(x))) as ds_for_raw:
-            x, y = zip(*(ds_for_raw[idx] for idx in selected_indices))
+        # with override_dataset_transform(trn_loader.dataset, Lambda(lambda x: np.array(x))) as ds_for_raw:
+        #     x, y = zip(*(ds_for_raw[idx] for idx in selected_indices))
+        if hasattr(trn_loader.dataset, "modality") and trn_loader.dataset.modality == "audio-visual":
+            x, y = zip(*(trn_loader.dataset[idx] for idx in selected_indices))
+        else:
+            with override_dataset_transform(trn_loader.dataset, Lambda(lambda x: np.array(x))) as ds_for_raw:
+                x, y = zip(*(ds_for_raw[idx] for idx in selected_indices))
         clock1 = time.time()
         print('| Selected {:d} train exemplars, time={:5.1f}s'.format(len(x), clock1 - clock0))
         return x, y
@@ -66,17 +71,26 @@ class RandomExemplarsSelector(ExemplarsSelector):
     def __init__(self, exemplars_dataset):
         super().__init__(exemplars_dataset)
 
-    def _select_indices(self, model: LLL_Net, sel_loader: DataLoader, exemplars_per_class: int, transform) -> Iterable:
-        num_cls = sum(model.task_cls)
-        result = []
+    # def _select_indices(self, model: LLL_Net, sel_loader: DataLoader, exemplars_per_class: int, transform) -> Iterable:
+    #     num_cls = sum(model.task_cls)
+    #     result = []
+    #     labels = self._get_labels(sel_loader)
+    #     for curr_cls in range(num_cls):
+    #         # get all indices from current class -- check if there are exemplars from previous task in the loader
+    #         cls_ind = np.where(labels == curr_cls)[0]
+    #         assert (len(cls_ind) > 0), "No samples to choose from for class {:d}".format(curr_cls)
+    #         assert (exemplars_per_class <= len(cls_ind)), "Not enough samples to store"
+    #         # select the exemplars randomly
+    #         result.extend(random.sample(list(cls_ind), exemplars_per_class))
+    #     return result
+
+    def _select_indices(self, model, sel_loader, exemplars_per_class, transform):
         labels = self._get_labels(sel_loader)
-        for curr_cls in range(num_cls):
-            # get all indices from current class -- check if there are exemplars from previous task in the loader
+        result = []
+        for curr_cls in np.unique(labels):  # <- 关键
             cls_ind = np.where(labels == curr_cls)[0]
-            assert (len(cls_ind) > 0), "No samples to choose from for class {:d}".format(curr_cls)
-            assert (exemplars_per_class <= len(cls_ind)), "Not enough samples to store"
-            # select the exemplars randomly
-            result.extend(random.sample(list(cls_ind), exemplars_per_class))
+            n_pick = min(exemplars_per_class, len(cls_ind))
+            result.extend(random.sample(list(cls_ind), n_pick))
         return result
 
     def _get_labels(self, sel_loader):

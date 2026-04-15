@@ -3,7 +3,7 @@ set -e
 
 GPU=${1:-0}
 DATASET=${2:-VGGSound_balance}
-SCENARIO=${3:-full}      # smoke | full | reverse
+SCENARIO=${3:-balance}   # smoke | balance | reverse | custom
 SEED=${4:-0}
 RESULTS_DIR=${5:-"../results"}
 
@@ -18,62 +18,103 @@ echo "PROJECT_DIR: $PROJECT_DIR"
 echo "SRC_DIR: $SRC_DIR"
 echo "RESULTS_DIR: $RESULTS_DIR"
 
-# default
+# -----------------------------
+# defaults (close to LTCIL)
+# -----------------------------
 NUM_TASKS=10
 NEPOCHS=200
 BATCH_SIZE=128
 NUM_WORKERS=0
+PIN_MEMORY=false
 LR=1e-3
 WD=1e-4
-SCHEDULE_STEP="100"
-MEMORY=1500
+SCHEDULE_STEP=(50000)
+MEMORY=500
 EXP_NAME="avcil_${DATASET}_${SCENARIO}_s${SEED}"
 
+# avcil losses (align train_incremental_ours.py)
+USE_INSTANCE=true
+USE_CLASS=true
+USE_ATTN=true
+TEMP_I=0.05
+TEMP_C=0.05
+LAM=0.5
+LAM_I=0.1
+LAM_C=1.0
+
+# -----------------------------
 # scenario switch
-if [ "$SCENARIO" = "smoke" ]; then
-  NUM_TASKS=3
-  NEPOCHS=2
-  BATCH_SIZE=32
-  NUM_WORKERS=0
-  MEMORY=200
-  EXP_NAME="smoke_${DATASET}_s${SEED}"
-elif [ "$SCENARIO" = "full" ]; then
-  # keep defaults
-  :
-elif [ "$SCENARIO" = "reverse" ]; then
-  # 你可绑定到特定 reverse 数据集配置
-  # DATASET=VGGSound_reverse (前提是你在 dataset_config 里注册过)
-  NUM_TASKS=10
-  NEPOCHS=200
-  MEMORY=500
-  EXP_NAME="reverse_${DATASET}_s${SEED}"
-else
-  echo "Unknown scenario: $SCENARIO"
-  exit 1
-fi
+# -----------------------------
+case "$SCENARIO" in
+  smoke)
+    NUM_TASKS=3
+    NEPOCHS=2
+    BATCH_SIZE=32
+    NUM_WORKERS=0
+    MEMORY=200
+    EXP_NAME="smoke_${DATASET}_s${SEED}"
+    ;;
+  balance)
+    # match @train_incremental.sh core training params
+    # dataset should be VGGSound_balance
+    NUM_TASKS=10
+    NEPOCHS=200
+    BATCH_SIZE=256
+    NUM_WORKERS=4
+    MEMORY=500
+    LR=1e-3
+    WD=1e-4
+    SCHEDULE_STEP=(50000)
+    EXP_NAME="balance_${DATASET}_s${SEED}"
+    ;;
+  reverse)
+    NUM_TASKS=10
+    NEPOCHS=200
+    BATCH_SIZE=256
+    NUM_WORKERS=0
+    MEMORY=500
+    LR=1e-3
+    WD=1e-4
+    SCHEDULE_STEP=(50000)
+    EXP_NAME="reverse_${DATASET}_s${SEED}"
+    ;;
+  custom)
+    # keep defaults, user can override by editing script or env vars
+    ;;
+  *)
+    echo "Unknown scenario: $SCENARIO"
+    echo "Supported: smoke | balance | reverse | custom"
+    exit 1
+    ;;
+esac
+
+# loss flags
+LOSS_FLAGS=()
+if [ "$USE_INSTANCE" = true ]; then LOSS_FLAGS+=(--instance-contrastive); fi
+if [ "$USE_CLASS" = true ]; then LOSS_FLAGS+=(--class-contrastive); fi
+if [ "$USE_ATTN" = true ]; then LOSS_FLAGS+=(--attn-score-distil); fi
 
 PYTHONPATH=$SRC_DIR CUDA_VISIBLE_DEVICES=$GPU \
 python3 -u $SRC_DIR/main_incremental.py \
-  --exp-name $EXP_NAME \
-  --results-path $RESULTS_DIR \
-  --datasets $DATASET \
+  --exp-name "$EXP_NAME" \
+  --results-path "$RESULTS_DIR" \
+  --datasets "$DATASET" \
   --approach avcil \
   --network avcil_net \
-  --seed $SEED \
+  --seed "$SEED" \
   --gpu 0 \
-  --num-tasks $NUM_TASKS \
-  --nepochs $NEPOCHS \
-  --batch-size $BATCH_SIZE \
-  --num-workers $NUM_WORKERS \
-  --lr $LR \
-  --weight-decay $WD \
-  --schedule_step $SCHEDULE_STEP \
-  --num-exemplars $MEMORY \
-  --instance-contrastive \
-  --class-contrastive \
-  --attn-score-distil \
-  --instance-contrastive-temperature 0.05 \
-  --class-contrastive-temperature 0.05 \
-  --lam 0.5 \
-  --lam-I 0.1 \
-  --lam-C 1.0
+  --num-tasks "$NUM_TASKS" \
+  --nepochs "$NEPOCHS" \
+  --batch-size "$BATCH_SIZE" \
+  --num-workers "$NUM_WORKERS" \
+  --pin-memory "$PIN_MEMORY" \
+  --lr "$LR" \
+  --weight-decay "$WD" \
+  --schedule_step "${SCHEDULE_STEP[@]}" \
+  --num-exemplars "$MEMORY" \
+  "${LOSS_FLAGS[@]}" \
+  --instance-contrastive-temperature "$TEMP_I" \
+  --class-contrastive-temperature "$TEMP_C" \
+  --lam "$LAM" \
+  --lam-I "$LAM_I" \
+  --lam-C "$LAM_C"

@@ -6,6 +6,7 @@ from itertools import cycle
 
 from .incremental_learning import Inc_Learning_Appr
 from datasets.exemplars_dataset import ExemplarsDataset
+from datasets.av_exemplars_dataset import AVExemplarsDataset
 
 
 class Appr(Inc_Learning_Appr):
@@ -53,7 +54,7 @@ class Appr(Inc_Learning_Appr):
 
     @staticmethod
     def exemplars_dataset_class():
-        return ExemplarsDataset
+        return AVExemplarsDataset
 
     @staticmethod
     def extra_parser(args):
@@ -243,15 +244,29 @@ class Appr(Inc_Learning_Appr):
         with torch.no_grad():
             total_loss, total_acc_taw, total_acc_tag, total_num = 0, 0, 0, 0
             self.model.eval()
+
+            # IMPORTANT:
+            # clear train-step caches so criterion() won't enter incremental replay/KD branch during eval
+            self._cache_data_bs = None
+            self._cache_ex_bs = None
+            self._cache_old_out = None
+            self._cache_old_spatial = None
+            self._cache_old_temporal = None
+            self._cache_audio_feature = None
+            self._cache_visual_feature = None
+            self._cache_spatial_attn = None
+            self._cache_temporal_attn = None
+
             for data, targets in val_loader:
                 visual = data[0].to(self.device)
                 audio = data[1].to(self.device)
                 targets = targets.to(self.device)
 
-                # now the LLLNet in avcil_network.py has already wrap the logit as a list for criterion style, so we can directly use that without modification. If your model returns a single tensor, you can wrap it in a list like outputs = [self.model((visual, audio))] to keep the criterion style consistent.
-                outputs_list = self.model((visual, audio))   # single head logits tensor [B, C]
+                # LLL_Net.forward default already returns [logits]
+                outputs_list = self.model((visual, audio))
 
-                loss = self.criterion(t, outputs_list, targets)
+                # eval should be plain CE on current logits/targets
+                loss = self._ce_loss(outputs_list[0], targets)
                 hits_taw, hits_tag = self.calculate_metrics(outputs_list, targets)
 
                 total_loss += loss.item() * len(targets)
@@ -263,18 +278,18 @@ class Appr(Inc_Learning_Appr):
 
     def criterion(self, t, outputs, targets):
         """
-        Keep criterion style:
-        - outputs: list with one tensor [B, C]
-        - targets: global labels
+        outputs: [logits] where logits shape is [B, C_total]
+        targets: global labels, shape [B]
         """
         out = outputs[0]
 
+        # step0 or eval(no cache) -> plain CE
         if t == 0 or self._cache_data_bs is None:
-            # Just ce loss for step 0
             return self._ce_loss(out, targets)
 
         data_bs = self._cache_data_bs
         ex_bs = self._cache_ex_bs
+
         old_out = self._cache_old_out
         old_spatial = self._cache_old_spatial
         old_temporal = self._cache_old_temporal
@@ -286,95 +301,61 @@ class Appr(Inc_Learning_Appr):
         curr_labels = targets[:data_bs]
         ex_labels = targets[data_bs:data_bs + ex_bs]
 
-        # 当前 step 的新类索引范围
-        # 单头设置下：old 类个数 = 已学总类 - 当前task类数
+        # ---------- stable class partition ----------
+        # old model output dim = number of old classes (most stable source)
+        old_cls = old_out.shape[1]
         total_cls = out.shape[1]
-        # 依赖 dataloader 固定每task类数
-        # 从 model.task_cls 提取总类（单头是[total]）
-        # old 类数 = total - 当前task真实类别数（由当前batch标签推断不稳），这里按数据集协议用 task_offset:
-        # 在该工程中 main_incremental 的 taskcla 每task类别固定，labels天然全局id，因此可用：
-        # old_cls = t * ncls_per_task
-        # ncls_per_task 可以从当前 task 中 unique 估计；更稳妥是用 model.task_offset（单头时只有[0]）
-        # 因为你是固定切分，这里用当前batch新类范围按 t 推断：
-        # 通过 labels 可估 ncls_per_task，但更稳定的方法是在命令行配置里固定。
-        # 这里采用与原AVCIL一致：使用当前task真实新类数 = curr_labels unique上限不可靠 -> 用增量边界 from dataset split
-        # 简化并稳定：从 old_out.shape[1] 和 t 推断不行；故直接按当前任务新类logits切片：
-        # 你当前实验固定每task同类数时有效（与原脚本一致）
+        n_new = total_cls - old_cls
+        assert n_new > 0, f"Invalid class split: total={total_cls}, old={old_cls}"
 
-        # n_new aims to estimate the number of new classes. To infer, rather than using a specific number, is more flexible and can adapt to different splits. 
-        # however, this part is tricky, and different from original AVCIL code
-        n_new = torch.unique(curr_labels).numel()
-        # 为避免 batch 未覆盖全部新类，fallback 用近似: 平均task大小. However, it doesn't work if task sizes are different, or the first task contains many classes (for example, 50/10/10 split)
-        if t > 0:
-            n_new = max(n_new, int(total_cls // (t + 1)))
-        else:
-            n_new = total_cls
-        old_cls = total_cls - n_new
-
-        # For example, [20, 21, 22] -> [0, 1, 2] for a task with 3 new classes starting from global class 20.
+        # current-task labels are global ids in [old_cls, total_cls)
         curr_labels_local = curr_labels - old_cls
-        '''
-            Original AVCIL code:
-                curr_out = out[:data_batch_size, last_step_out_class_num:]
-                loss_curr = CE_loss(args.class_num_per_step, curr_out, labels_)
+        curr_labels_local = curr_labels_local.clamp(min=0, max=n_new - 1)
 
-                prev_out = out[data_batch_size:data_batch_size+exemplar_data_batch_size, :last_step_out_class_num]
-                loss_prev = CE_loss(last_step_out_class_num, prev_out, exemplar_labels)
+        # ---------- CE (same idea as original AVCIL) ----------
+        curr_out = out[:data_bs, old_cls:]                       # logits for new classes
+        prev_out = out[data_bs:data_bs + ex_bs, :old_cls]       # logits for old classes on exemplars
 
-            def CE_loss(num_classes, logits, label):
-                targets = F.one_hot(label, num_classes=num_classes)
-                loss = -torch.mean(torch.sum(F.log_softmax(logits, dim=-1) * targets, dim=1))
-
-                return loss
-        '''
-        # the implementations here should get the correct answer, but we should aware that it's implementation is different from original AVCIL code
-        curr_out = out[:data_bs, old_cls:]
-        prev_out = out[data_bs:data_bs + ex_bs, :old_cls]
-
-        loss_curr = self._ce_loss_with_nclass(curr_out, curr_labels_local, curr_out.shape[1])
-        loss_prev = self._ce_loss_with_nclass(prev_out, ex_labels, prev_out.shape[1]) if old_cls > 0 else 0.0
-        if old_cls > 0:
+        loss_curr = self._ce_loss_with_nclass(curr_out, curr_labels_local, n_new)
+        if old_cls > 0 and ex_bs > 0:
+            loss_prev = self._ce_loss_with_nclass(prev_out, ex_labels, old_cls)
             loss_ce = (loss_curr * data_bs + loss_prev * ex_bs) / (data_bs + ex_bs)
-        # actually we don't need to consider this branch, bucause '_forward_loss_incremental' contains that old_cls>0
         else:
             loss_ce = loss_curr
 
-        '''
-            Original AVCIL code:
-                for t in range(step):
-                    start = t * args.class_num_per_step
-                    end = (t + 1) * args.class_num_per_step
-
-                    soft_target = F.softmax(old_out[:, start:end] / T, dim=1)
-                    output_log = F.log_softmax(out[:, start:end] / T, dim=1)
-                    loss_KD[t] = F.kl_div(output_log, soft_target, reduction='batchmean') * (T**2)
-                loss_KD = loss_KD.sum()
-        '''
+        # ---------- KD ----------
         loss_kd = 0.0
         if old_cls > 0 and t > 0:
-            # original AVCIL code use args.class_num_per_step to slice logits
-            step_size = old_cls // t
-            old_logits = old_out[:, :old_cls]
-            cur_logits = out[:, :old_cls]
+            # ensure same batch axis (safety; normally both are data_bs+ex_bs)
+            kd_bs = min(out.shape[0], old_out.shape[0])
+            cur_logits = out[:kd_bs, :old_cls]
+            old_logits = old_out[:kd_bs, :old_cls]
+
+            # split by past tasks (compatible with equal-task split assumption)
+            step_size = max(1, old_cls // t)
             for j in range(t):
                 s = j * step_size
                 e = (j + 1) * step_size if j < t - 1 else old_cls
+                if s >= e:
+                    continue
                 soft_target = F.softmax(old_logits[:, s:e] / self.T, dim=1)
                 output_log = F.log_softmax(cur_logits[:, s:e] / self.T, dim=1)
                 loss_kd = loss_kd + F.kl_div(output_log, soft_target, reduction='batchmean') * (self.T ** 2)
 
         loss = loss_ce + loss_kd
 
-        # this three parts(instance contrastive, class contrastive, attn score distil) are actually the same as original AVCIL code
+        # ---------- optional losses ----------
         if self.instance_contrastive:
-            loss_ic = self._instance_contrastive_loss(audio_feature, visual_feature,
-                                                      temperature=self.instance_contrastive_temperature)
+            loss_ic = self._instance_contrastive_loss(
+                audio_feature, visual_feature, temperature=self.instance_contrastive_temperature
+            )
             loss = loss + self.lam_I * loss_ic
 
         if self.class_contrastive:
             all_labels = targets[:data_bs + ex_bs]
-            loss_cc = self._class_contrastive_loss(audio_feature, visual_feature, all_labels,
-                                                   temperature=self.class_contrastive_temperature)
+            loss_cc = self._class_contrastive_loss(
+                audio_feature, visual_feature, all_labels, temperature=self.class_contrastive_temperature
+            )
             loss = loss + self.lam_C * loss_cc
 
         if self.attn_score_distil and ex_bs > 0:
